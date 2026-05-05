@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+# type: ignore
+# pylint: disable=undefined-variable
 import pandas as pd
 import talib as ta
 

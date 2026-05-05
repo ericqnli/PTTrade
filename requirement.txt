@@ -1,0 +1,5 @@
+pandas
+numpy
+TA-Lib
+tqdm
+# 如果后续还需要其他库，可以继续在这里添加

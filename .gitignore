@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+data/
+cache/
+backtest/
+*.csv
+*.xlsx
+.venv
+venv/
+ENV/
+.vscode/
+.idea/
+*.png
+*.jpg

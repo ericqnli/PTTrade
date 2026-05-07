@@ -116,7 +116,13 @@ def get_multi_timeframe_indicators(security):
 
 
 def detect_macd_divergence(close_prices, macd_hist, lookback=35):
-    """改进版MACD底背离检测（检测最近两个低点）"""
+    """
+    改进版 MACD 底背离检测
+    
+    判断条件：
+        1. 价格出现最近两个低点，且后者更低
+        2. MACD 柱状线在对应位置未创新低（形成背离）
+    """
     if len(close_prices) < lookback or len(macd_hist) < lookback:
         return False
     

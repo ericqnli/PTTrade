@@ -37,6 +37,9 @@ def initialize(context):
     g.volume_confirm = True
     g.max_pos_per_stock = 0.23
     g.max_total_pos = 0.92
+
+    g.max_pos_per_stock = 0.28      # 单股最大仓位（推荐 0.25~0.30）
+    current_max_total = 0.92        # 总仓位上限（留8%现金）
     
     set_benchmark('000300.XSHG')
     run_daily(context, trade_logic, time='09:35')
@@ -233,72 +236,103 @@ def trade_logic(context):
             log.info(f"【卖出执行】{sec} | 原因：{reason} | 价格 {current_price:.3f} | 盈亏 {(profit_ratio-1):.2%}")
     
     # ====================== 买入逻辑 ======================
-# 全局仓位检查
-if (total_value - cash) / total_value >= current_max_total:
-    log.info(f"【仓位已满】当前仓位 {(total_value - cash)/total_value:.1%}，停止买入")
-    return
-
-# 1. 收集所有有效买入信号
-buy_candidates = []
-
-for sec in g.securities:
-    # 已持仓的跳过（不加仓）
-    if portfolio.positions.get(sec) and portfolio.positions[sec].amount > 0:
-        continue
-    
-    ind = indicators.get(sec)
-    if not ind.get('valid'):
-        continue
-        
-    df_daily = daily_data.get(sec)
-    if df_daily is None or len(df_daily) < 40:
-        continue
-    
-    current_price = ind['price']
-    buy_signal, signal_score, reasons = is_buy_signal(current_price, ind, df_daily)
-    
-    if buy_signal:
-        buy_candidates.append({
-            'security': sec,
-            'score': signal_score,
-            'price': current_price,
-            'reasons': reasons
-        })
-
-# 2. 按信号强度从高到低排序（关键优化）
-buy_candidates.sort(key=lambda x: x['score'], reverse=True)
-
-# 3. 依次执行买入
-for candidate in buy_candidates:
-    # 再次检查仓位（防止前面已买满）
+    # 全局仓位检查
     if (total_value - cash) / total_value >= current_max_total:
-        break
-    
-    sec = candidate['security']
-    score = candidate['score']
-    reasons = candidate['reasons']
-    
-    log.info(f"【强买入信号】{sec} | 总分 {score}/100 | 价格 {candidate['price']:.3f}")
-    for r in reasons:
-        log.info(f"   └─ {r}")
-    log.info("─" * 70)
-    
-    # 计算买入金额
-    buy_value = min(
-        cash * 0.45,                    # 单次最多用剩余现金45%
-        total_value * g.max_pos_per_stock,  # 单股仓位上限
-        cash * 0.98                     # 保留2%现金缓冲
-    )
-    
-    if buy_value > 8000:
-        order_value(sec, buy_value)
-        log.info(f"【买入执行】{sec} | 金额 {buy_value:,.0f} | 信号强度 {score}分")
+        log.info(f"【仓位已满】当前仓位 {(total_value - cash)/total_value:.1%}，停止买入")
+        return
+
+    # 1. 收集所有有效买入信号
+    buy_candidates = []
+
+    for sec in g.securities:
+        # 已持仓的跳过（不加仓）
+        if portfolio.positions.get(sec) and portfolio.positions[sec].amount > 0:
+            continue
+        
+        ind = indicators.get(sec)
+        if not ind.get('valid'):
+            continue
+            
+        df_daily = daily_data.get(sec)
+        if df_daily is None or len(df_daily) < 40:
+            continue
+        
+        current_price = ind['price']
+        buy_signal, signal_score, reasons = is_buy_signal(current_price, ind, df_daily)
+        
+        if buy_signal:
+            buy_candidates.append({
+                'security': sec,
+                'score': signal_score,
+                'price': current_price,
+                'reasons': reasons
+            })
+
+    # 2. 按信号强度从高到低排序（关键优化）
+    buy_candidates.sort(key=lambda x: x['score'], reverse=True)
+
+    # 3. 依次执行买入
+    for candidate in buy_candidates:
+        # 再次检查仓位（防止前面已买满）
+        if (total_value - cash) / total_value >= current_max_total:
+            break
+        
+        sec = candidate['security']
+        score = candidate['score']
+        reasons = candidate['reasons']
+        
+        log.info(f"【强买入信号】{sec} | 总分 {score}/100 | 价格 {candidate['price']:.3f}")
+        for r in reasons:
+            log.info(f"   └─ {r}")
         log.info("─" * 70)
         
-        # 即时更新现金（防止重复买入）
-        cash -= buy_value
-    else:
-        log.info(f"【金额不足】{sec} 剩余现金不足8000，跳过")
+        # 计算买入金额
+        buy_value = min(
+            cash * 0.45,                    # 单次最多用剩余现金45%
+            total_value * g.max_pos_per_stock,  # 单股仓位上限
+            cash * 0.98                     # 保留2%现金缓冲
+        )
+        
+        if buy_value > 8000:
+            order_value(sec, buy_value)
+            log.info(f"【买入执行】{sec} | 金额 {buy_value:,.0f} | 信号强度 {score}分")
+            log.info("─" * 70)
+            
+            # 即时更新现金（防止重复买入）
+            cash -= buy_value
+        else:
+            log.info(f"【金额不足】{sec} 剩余现金不足8000，跳过")
+        # ====================== 买入逻辑 ======================
+
+        if (total_value - cash) / total_value >= current_max_total:
+            return
+            
+        for sec in g.securities:
+            if (total_value - cash) / total_value >= current_max_total:
+                break
+            if portfolio.positions.get(sec) and portfolio.positions[sec].amount > 0:
+                continue
+                
+            ind = indicators.get(sec)
+            if not ind.get('valid'):
+                continue
+            df_daily = daily_data.get(sec)
+            if df_daily is None or len(df_daily) < 40:
+                continue
+                
+            current_price = ind['price']
+            buy_signal, signal_score, reasons = is_buy_signal(current_price, ind, df_daily)
+            
+            if buy_signal:
+                log.info(f"【强买入信号】{sec} | 总分 {signal_score}/100 | 价格 {current_price:.3f}")
+                for r in reasons:
+                    log.info(f"   └─ {r}")
+                log.info("─" * 60)
+                
+                buy_value = min(cash * 0.48, total_value * g.max_pos_per_stock)
+                if buy_value > 8000:
+                    order_value(sec, buy_value)
+                    log.info(f"【买入执行】{sec} | 金额 {buy_value:,.0f}")
 
 
 def tail_check(context):

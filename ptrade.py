@@ -90,6 +90,7 @@ def get_multi_timeframe_indicators(security):
         'macd': ta.MACD(close_d, g.macd_fast, g.macd_slow, g.macd_signal)[0][-1],
         'macd_signal': ta.MACD(close_d, g.macd_fast, g.macd_slow, g.macd_signal)[1][-1],
         'macd_hist': ta.MACD(close_d, g.macd_fast, g.macd_slow, g.macd_signal)[2][-1],
+        'macd_hist_hist': ta.MACD(close_d, g.macd_fast, g.macd_slow, g.macd_signal)[2],
         'volume_ma': ta.SMA(vol_d, 20)[-1],
         'current_volume': vol_d[-1],
         'volume_ratio': vol_d[-1] / ta.SMA(vol_d, 20)[-1] if ta.SMA(vol_d, 20)[-1] > 0 else 1.0,
@@ -161,7 +162,7 @@ def is_buy_signal(price, ind, df_daily):
         near_fib = True
     
     # 3. RSI + MACD背离
-    macd_div = detect_macd_divergence(df_daily['close'].values, [ind['macd_hist']] * len(df_daily))
+    macd_div = detect_macd_divergence(df_daily['close'].values, ind['macd_hist_hist'])
     if ind['rsi'] <= 32:
         score += 20
         reasons.append(f"RSI极度超卖 ({ind['rsi']:.1f})")
@@ -295,6 +296,7 @@ def trade_logic(context):
         
         if buy_value > 8000:
             order_value(sec, buy_value)
+            cash -= buy_value  # 更新现金以避免超额买入
             log.info(f"【买入执行】{sec} | 金额 {buy_value:,.0f} | 信号强度 {score}分")
             log.info("─" * 70)
             

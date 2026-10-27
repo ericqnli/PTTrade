@@ -7,7 +7,7 @@
 主要变更:
 - 取消首日无条件建仓, 买卖只按已收盘日线信号
 - 底仓不参与买卖, 每次买入固定股数
-- 死叉卖出策略仓一半, 破位或最高价回撤 12% 清掉策略仓
+- 死叉卖出策略仓一半, 收盘跌破 MA20 且 DMI 转空时清掉策略仓
 - 收盘输出参数和当前状态
 """
 
@@ -30,6 +30,7 @@ def initialize(context):
 
     g.ma_fast = 5
     g.ma_slow = 10
+    g.break_ma = 20
     # 买入 RSI 上限 70→80，避免强趋势金叉被滤掉
     g.rsi_max_for_buy = 80
     g.dmi_period = 14
@@ -45,13 +46,10 @@ def initialize(context):
     g.volume_confirm_mult_buy = 0.8
 
     g.sell_ratio = 0.5
-    # 从策略仓最高价回撤该比例，卖掉策略仓。底仓不动。不用 ATR
-    g.trail_pct = 0.12
 
     g.rsi_period = 14
     g.last_golden_cross_date = None
     g.last_death_cross_date = None
-    g.entry_high = {}
     g.base_amount = {}
 
     set_universe(g.security_list)
@@ -60,7 +58,7 @@ def initialize(context):
         context.portfolio.cash = 1000000
 
     log.info(f"买入量能倍数: {g.volume_confirm_mult_buy} | 每次买入: {g.add_once} 股 | "
-             f"策略仓上限: {g.max_position_pct:.0%} | 死叉卖出比例: {g.sell_ratio} | 回撤止损: {g.trail_pct:.0%}")
+             f"策略仓上限: {g.max_position_pct:.0%} | 死叉卖出比例: {g.sell_ratio}")
 
 # ==================== 数据 & 指标 ====================
 def get_daily_data(stock, count=80):
@@ -116,12 +114,6 @@ def latest_price(data, stock, df):
         if value is not None:
             return value
     return float(df['close'].iloc[-1])
-
-def latest_high(data, stock, df, price):
-    value = _bar_field(data, stock, 'high')
-    if value is not None:
-        return max(value, price)
-    return max(float(df['high'].iloc[-1]), price)
 
 def calc_rsi(df, period=14):
     delta = df['close'].diff()
@@ -233,19 +225,8 @@ def calc_half_sell(tradable):
         return int(tradable)
     return amount
 
-def update_entry_high(stock, current_pos, high_price):
-    if current_pos <= 0:
-        g.entry_high.pop(stock, None)
-        return None
-    held = g.entry_high.get(stock)
-    if held is None:
-        g.entry_high[stock] = high_price
-    else:
-        g.entry_high[stock] = max(held, high_price)
-    return g.entry_high[stock]
-
 def _ready_daily(df):
-    need = max(g.ma_slow + 2, g.rsi_period + 2, g.dmi_period * 2 + 2, g.macd_slow + g.macd_signal + 2, 8)
+    need = max(g.ma_slow + 2, g.break_ma + 2, g.rsi_period + 2, g.dmi_period * 2 + 2, g.macd_slow + g.macd_signal + 2, 8)
     return df is not None and len(df) >= need
 
 def daily_buy_signal(df):
@@ -291,15 +272,15 @@ def daily_sell_signal(df):
     return True, _cross_date(df)
 
 def trend_broken(df, dmi):
-    """收盘跌破 MA10，且 DMI 已转为空头并有趋势。用于无量阴跌时清仓。"""
+    """收盘跌破 MA20，且 DMI 已转为空头并有趋势。用于无量阴跌时清仓。"""
     if dmi is None or not _ready_daily(df):
         return False
     plus_di, minus_di, _, adx = dmi
-    ma_slow = calc_ma(df, g.ma_slow).iloc[-1]
+    ma_break = calc_ma(df, g.break_ma).iloc[-1]
     close_now = df['close'].iloc[-1]
-    if pd.isna(ma_slow) or pd.isna(close_now):
+    if pd.isna(ma_break) or pd.isna(close_now):
         return False
-    return close_now < ma_slow and minus_di > plus_di and adx >= g.adx_min
+    return close_now < ma_break and minus_di > plus_di and adx >= g.adx_min
 
 # ==================== handle_data ====================
 def handle_data(context, data):
@@ -311,7 +292,6 @@ def handle_data(context, data):
                 continue
 
             current_price = latest_price(data, stock, df)
-            high_price = latest_high(data, stock, df, current_price)
             available_cash = context.portfolio.cash
             dmi = _dmi_now(df)
 
@@ -319,7 +299,6 @@ def handle_data(context, data):
             current_pos = getattr(position, 'amount', 0) or 0
             base_pos = remember_base(stock, current_pos)
             tradable = strategy_amount(stock, current_pos)
-            peak = update_entry_high(stock, tradable, high_price)
 
             fast_now = calc_ma(df, g.ma_fast).iloc[-1]
             slow_now = calc_ma(df, g.ma_slow).iloc[-1]
@@ -333,24 +312,17 @@ def handle_data(context, data):
             buy_ok, buy_date = daily_buy_signal(df)
             sell_ok, sell_date = daily_sell_signal(df)
             broken = trend_broken(df, dmi)
-            trail_hit = peak is not None and current_price < peak * (1 - g.trail_pct)
 
             log.info(f"[{stock}] 价:{current_price:.2f} | MA{g.ma_fast}:{fast_now:.2f} | MA{g.ma_slow}:{slow_now:.2f} | "
                      f"RSI:{rsi:.1f} | DIF:{dif_now:.4f} | DEA:{dea_now:.4f} | "
                      f"+DI:{plus_di:.1f} | -DI:{minus_di:.1f} | ADX:{adx:.1f} | "
-                     f"金叉:{buy_ok} | 死叉:{sell_ok} | 破位:{broken} | 回撤止损:{trail_hit} | "
+                     f"金叉:{buy_ok} | 死叉:{sell_ok} | 破位:{broken} | "
                      f"底仓:{base_pos} | 策略仓:{tradable} | 总持仓:{current_pos}")
 
             exited = False
-            if tradable > 0 and trail_hit:
-                log.info(f"[{stock}] 回撤止损，卖出策略仓 {int(tradable)} 股，底仓保留")
+            if tradable > 0 and broken:
+                log.info(f"[{stock}] 收盘跌破 MA{g.break_ma}，卖出策略仓 {int(tradable)} 股，底仓保留")
                 order(stock, -int(tradable))
-                g.entry_high.pop(stock, None)
-                exited = True
-            elif tradable > 0 and broken:
-                log.info(f"[{stock}] 趋势破位，卖出策略仓 {int(tradable)} 股，底仓保留")
-                order(stock, -int(tradable))
-                g.entry_high.pop(stock, None)
                 exited = True
             elif sell_ok and sell_date != g.last_death_cross_date and tradable > 0:
                 sell_amount = calc_half_sell(tradable)
@@ -370,8 +342,6 @@ def handle_data(context, data):
             log.info(f"[{stock}] 【日线MA{g.ma_fast}/{g.ma_slow}金叉】买入 {buy_amount} 股")
             order(stock, buy_amount)
             g.last_golden_cross_date = buy_date
-            held_high = g.entry_high.get(stock, high_price)
-            g.entry_high[stock] = max(held_high, high_price)
 
         except Exception as e:
             log.error(f"[{stock}] 异常: {str(e)}")
@@ -414,17 +384,7 @@ def log_close_status(context, data, stock):
     broken = trend_broken(df, dmi)
 
     log.info(f"[{stock}] 底仓 {base_pos} 股不参与买卖。策略仓 {tradable} 股，总持仓 {current_pos} 股。"
-             f"策略仓市值 {strategy_value:.0f}，占账户 {_pct_text(strategy_value, total_value)}，上限 {g.max_position_pct:.0%}。")
-
-    peak = g.entry_high.get(stock)
-    if tradable > 0 and peak:
-        stop_price = peak * (1 - g.trail_pct)
-        log.info(f"[{stock}] 策略仓最高价 {peak:.2f}，{g.trail_pct:.0%} 回撤止损价 {stop_price:.2f}，"
-                 f"现价 {price:.2f}。{'已跌破止损价' if price < stop_price else '尚未触及回撤止损'}。")
-    elif tradable > 0:
-        log.info(f"[{stock}] 策略仓 {tradable} 股，最高价尚未记下，现价 {price:.2f}。")
-    else:
-        log.info(f"[{stock}] 目前没有策略仓，回撤止损不生效。现价 {price:.2f}。")
+             f"策略仓市值 {strategy_value:.0f}，占账户 {_pct_text(strategy_value, total_value)}，上限 {g.max_position_pct:.0%}。现价 {price:.2f}。")
 
     ma_up = slow_now > slow_prev
     above_slow = price > slow_now
@@ -449,15 +409,15 @@ def log_close_status(context, data, stock):
         macd_text = (f"DIF {dif_now:.4f} {'低于' if dif_now < dea_now else '不低于'} DEA {dea_now:.4f}，"
                      f"DIF {'在零轴下' if dif_now < 0 else '在零轴上'}")
     half_amount = calc_half_sell(tradable)
+    break_text = f"已跌破 MA{g.break_ma}，会卖出全部策略仓" if broken else f"未跌破 MA{g.break_ma}"
     log.info(f"[{stock}] {macd_text}。今日{'是' if sell_ok else '不是'}死叉卖出日，"
-             f"若卖出则为策略仓 {half_amount} 股。"
-             f"趋势{'已破位，会卖出全部策略仓' if broken else '未破位'}。")
+             f"若卖出则为策略仓 {half_amount} 股。趋势{break_text}。")
     log.info(f"[{stock}] 最近一次金叉 {g.last_golden_cross_date or '无'}，最近一次死叉 {g.last_death_cross_date or '无'}。")
 
 def after_trading_end(context, data):
     log.info("=== 收盘总结 ===")
     log.info(f"参数 | 每次买入 {g.add_once} 股 | 策略仓上限 {g.max_position_pct:.0%}（不含底仓） | "
-             f"死叉卖出策略仓的 {g.sell_ratio:.0%} | 回撤止损 {g.trail_pct:.0%} | "
+             f"死叉卖出策略仓的 {g.sell_ratio:.0%} | 跌破 MA{g.break_ma} 清掉策略仓 | "
              f"MA{g.ma_fast}/{g.ma_slow} | MACD {g.macd_fast}/{g.macd_slow}/{g.macd_signal} | "
              f"RSI 上限 {g.rsi_max_for_buy} | ADX 下限 {g.adx_min} | 买入量能 {g.volume_confirm_mult_buy}×前5日")
     log.info(f"账户现金 {context.portfolio.cash:.0f}")

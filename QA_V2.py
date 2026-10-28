@@ -9,6 +9,7 @@
 - 底仓不参与买卖, 每次买入固定股数
 - 死叉卖出策略仓一半, 收盘跌破 MA20 且 DMI 转空时清掉策略仓
 - 收盘输出参数和当前状态
+- 11:00 按已收盘日线委托, 15:10 后用当天日线只写日志
 """
 
 import pandas as pd
@@ -51,19 +52,46 @@ def initialize(context):
     g.last_golden_cross_date = None
     g.last_death_cross_date = None
     g.base_amount = {}
+    g.close_logged_date = None
+    g.trade_time = '11:00'
+    g.log_time = '15:10'
 
     set_universe(g.security_list)
+    run_daily(context, trade_at_11, time=g.trade_time)
+    if is_trade():
+        run_daily(context, log_after_close, time=g.log_time)
 
     if not is_trade():
         context.portfolio.cash = 1000000
 
     log.info(f"买入量能倍数: {g.volume_confirm_mult_buy} | 每次买入: {g.add_once} 股 | "
-             f"策略仓上限: {g.max_position_pct:.0%} | 死叉卖出比例: {g.sell_ratio}")
+             f"策略仓上限: {g.max_position_pct:.0%} | 死叉卖出比例: {g.sell_ratio} | "
+             f"委托时间: {g.trade_time} | 收盘日志: {g.log_time}")
 
 # ==================== 数据 & 指标 ====================
-def get_daily_data(stock, count=80):
-    # include 默认 False：只要已收盘日线
-    return get_history(count, g.timeframe, ['open', 'high', 'low', 'close', 'volume'], stock)
+def get_daily_data(stock, count=80, include=False):
+    return get_history(count, g.timeframe, ['open', 'high', 'low', 'close', 'volume'], stock, include=include)
+
+def load_daily(stock, context, include_today):
+    count = max(80, g.dmi_period * 3)
+    df = get_daily_data(stock, count, include=include_today)
+    if include_today:
+        return df
+    return drop_unclosed_daily(df, context)
+
+def order_price(stock, df):
+    """信号用昨天收盘的日线。11:00 委托价用当时的最新价，不读取分钟线。"""
+    try:
+        snap = get_snapshot(stock)
+        if isinstance(snap, dict):
+            item = snap.get(stock, snap)
+            if isinstance(item, dict):
+                price = float(item.get('last_px') or 0)
+                if price > 0:
+                    return price
+    except Exception:
+        pass
+    return float(df['close'].iloc[-1])
 
 def _bar_date(value):
     if hasattr(value, 'date') and not isinstance(value, str):
@@ -92,28 +120,6 @@ def drop_unclosed_daily(df, context):
     if last_date >= today:
         return df.iloc[:-1]
     return df
-
-def _bar_field(data, stock, name):
-    try:
-        bar = data[stock]
-    except Exception:
-        return None
-    value = getattr(bar, name, None)
-    if value is None:
-        try:
-            value = bar[name]
-        except Exception:
-            return None
-    if value is None or pd.isna(value) or value <= 0:
-        return None
-    return float(value)
-
-def latest_price(data, stock, df):
-    for name in ('price', 'close'):
-        value = _bar_field(data, stock, name)
-        if value is not None:
-            return value
-    return float(df['close'].iloc[-1])
 
 def calc_rsi(df, period=14):
     delta = df['close'].diff()
@@ -283,82 +289,90 @@ def trend_broken(df, dmi):
     return close_now < ma_break and minus_di > plus_di and adx >= g.adx_min
 
 # ==================== handle_data ====================
-def handle_data(context, data):
+def trade_at_11(context):
+    log.info(f"=== {g.trade_time} 交易检查, 条件成立立即委托 ===")
     for stock in g.security_list:
         try:
-            count = max(80, g.dmi_period * 3)
-            df = drop_unclosed_daily(get_daily_data(stock, count), context)
-            if not _ready_daily(df):
-                continue
-
-            current_price = latest_price(data, stock, df)
-            available_cash = context.portfolio.cash
-            dmi = _dmi_now(df)
-
-            position = get_position(stock)
-            current_pos = getattr(position, 'amount', 0) or 0
-            base_pos = remember_base(stock, current_pos)
-            tradable = strategy_amount(stock, current_pos)
-
-            fast_now = calc_ma(df, g.ma_fast).iloc[-1]
-            slow_now = calc_ma(df, g.ma_slow).iloc[-1]
-            rsi = calc_rsi(df, g.rsi_period).iloc[-1]
-            dif_line, dea_line = calc_macd(df)
-            dif_now, dea_now = dif_line.iloc[-1], dea_line.iloc[-1]
-            plus_di = minus_di = adx = float('nan')
-            if dmi is not None:
-                plus_di, minus_di, _, adx = dmi
-
-            buy_ok, buy_date = daily_buy_signal(df)
-            sell_ok, sell_date = daily_sell_signal(df)
-            broken = trend_broken(df, dmi)
-
-            log.info(f"[{stock}] 价:{current_price:.2f} | MA{g.ma_fast}:{fast_now:.2f} | MA{g.ma_slow}:{slow_now:.2f} | "
-                     f"RSI:{rsi:.1f} | DIF:{dif_now:.4f} | DEA:{dea_now:.4f} | "
-                     f"+DI:{plus_di:.1f} | -DI:{minus_di:.1f} | ADX:{adx:.1f} | "
-                     f"金叉:{buy_ok} | 死叉:{sell_ok} | 破位:{broken} | "
-                     f"底仓:{base_pos} | 策略仓:{tradable} | 总持仓:{current_pos}")
-
-            exited = False
-            if tradable > 0 and broken:
-                log.info(f"[{stock}] 收盘跌破 MA{g.break_ma}，卖出策略仓 {int(tradable)} 股，底仓保留")
-                order(stock, -int(tradable))
-                exited = True
-            elif sell_ok and sell_date != g.last_death_cross_date and tradable > 0:
-                sell_amount = calc_half_sell(tradable)
-                if sell_amount > 0:
-                    log.info(f"[{stock}] 【日线MACD死叉】卖出策略仓 {sell_amount} 股，底仓保留")
-                    order(stock, -sell_amount)
-                    g.last_death_cross_date = sell_date
-                    exited = True
-
-            if exited or not buy_ok or buy_date == g.last_golden_cross_date:
-                continue
-
-            total_value = account_value(context, current_pos * current_price)
-            buy_amount = fixed_buy_amount(tradable, current_price, available_cash, total_value)
-            if buy_amount <= 0:
-                continue
-            log.info(f"[{stock}] 【日线MA{g.ma_fast}/{g.ma_slow}金叉】买入 {buy_amount} 股")
-            order(stock, buy_amount)
-            g.last_golden_cross_date = buy_date
-
+            run_stock(context, stock, place_orders=True)
         except Exception as e:
             log.error(f"[{stock}] 异常: {str(e)}")
+
+def run_stock(context, stock, place_orders):
+    df = load_daily(stock, context, include_today=False)
+    if not _ready_daily(df):
+        return
+
+    current_price = order_price(stock, df)
+    available_cash = context.portfolio.cash
+    dmi = _dmi_now(df)
+
+    position = get_position(stock)
+    current_pos = getattr(position, 'amount', 0) or 0
+    base_pos = remember_base(stock, current_pos)
+    tradable = strategy_amount(stock, current_pos)
+
+    fast_now = calc_ma(df, g.ma_fast).iloc[-1]
+    slow_now = calc_ma(df, g.ma_slow).iloc[-1]
+    rsi = calc_rsi(df, g.rsi_period).iloc[-1]
+    dif_line, dea_line = calc_macd(df)
+    dif_now, dea_now = dif_line.iloc[-1], dea_line.iloc[-1]
+    plus_di = minus_di = adx = float('nan')
+    if dmi is not None:
+        plus_di, minus_di, _, adx = dmi
+
+    buy_ok, buy_date = daily_buy_signal(df)
+    sell_ok, sell_date = daily_sell_signal(df)
+    broken = trend_broken(df, dmi)
+
+    log.info(f"[{stock}] 价:{current_price:.2f} | MA{g.ma_fast}:{fast_now:.2f} | MA{g.ma_slow}:{slow_now:.2f} | "
+             f"RSI:{rsi:.1f} | DIF:{dif_now:.4f} | DEA:{dea_now:.4f} | "
+             f"+DI:{plus_di:.1f} | -DI:{minus_di:.1f} | ADX:{adx:.1f} | "
+             f"金叉:{buy_ok} | 死叉:{sell_ok} | 破位:{broken} | "
+             f"底仓:{base_pos} | 策略仓:{tradable} | 总持仓:{current_pos}")
+
+    if not place_orders:
+        return
+
+    exited = False
+    if tradable > 0 and broken:
+        log.info(f"[{stock}] 收盘跌破 MA{g.break_ma}，卖出策略仓 {int(tradable)} 股，底仓保留")
+        order(stock, -int(tradable))
+        exited = True
+    elif sell_ok and sell_date != g.last_death_cross_date and tradable > 0:
+        sell_amount = calc_half_sell(tradable)
+        if sell_amount > 0:
+            log.info(f"[{stock}] 【日线MACD死叉】卖出策略仓 {sell_amount} 股，底仓保留")
+            order(stock, -sell_amount)
+            g.last_death_cross_date = sell_date
+            exited = True
+
+    if exited or not buy_ok or buy_date == g.last_golden_cross_date:
+        return
+
+    total_value = account_value(context, current_pos * current_price)
+    buy_amount = fixed_buy_amount(tradable, current_price, available_cash, total_value)
+    if buy_amount <= 0:
+        return
+    log.info(f"[{stock}] 【日线MA{g.ma_fast}/{g.ma_slow}金叉】买入 {buy_amount} 股")
+    order(stock, buy_amount)
+    g.last_golden_cross_date = buy_date
+
+def handle_data(context, data):
+    # 委托改由 11:00 的 run_daily 发出。这里不下单，避免每分钟或 15:00 重复委托。
+    return
 
 def _pct_text(value, total):
     if total <= 0:
         return "账户市值无效"
     return f"{value / total:.1%}"
 
-def log_close_status(context, data, stock):
-    count = max(80, g.dmi_period * 3)
-    df = drop_unclosed_daily(get_daily_data(stock, count), context)
+def log_close_status(context, stock):
+    df = load_daily(stock, context, include_today=True)
     if not _ready_daily(df):
         log.info(f"[{stock}] 日线数据不足，无法判断当前状态")
         return
 
-    price = latest_price(data, stock, df)
+    price = float(df['close'].iloc[-1])
     position = get_position(stock)
     current_pos = getattr(position, 'amount', 0) or 0
     base_pos = g.base_amount.get(stock)
@@ -414,7 +428,11 @@ def log_close_status(context, data, stock):
              f"若卖出则为策略仓 {half_amount} 股。趋势{break_text}。")
     log.info(f"[{stock}] 最近一次金叉 {g.last_golden_cross_date or '无'}，最近一次死叉 {g.last_death_cross_date or '无'}。")
 
-def after_trading_end(context, data):
+def log_after_close(context, data=None):
+    today = _context_date(context)
+    if today is not None and g.close_logged_date == today:
+        return
+    g.close_logged_date = today
     log.info("=== 收盘总结 ===")
     log.info(f"参数 | 每次买入 {g.add_once} 股 | 策略仓上限 {g.max_position_pct:.0%}（不含底仓） | "
              f"死叉卖出策略仓的 {g.sell_ratio:.0%} | 跌破 MA{g.break_ma} 清掉策略仓 | "
@@ -423,6 +441,9 @@ def after_trading_end(context, data):
     log.info(f"账户现金 {context.portfolio.cash:.0f}")
     for stock in g.security_list:
         try:
-            log_close_status(context, data, stock)
+            log_close_status(context, stock)
         except Exception as e:
             log.error(f"[{stock}] 收盘总结异常: {str(e)}")
+
+def after_trading_end(context, data):
+    log_after_close(context, data)

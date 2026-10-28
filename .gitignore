@@ -23,3 +23,8 @@ env/
 data/
 cache/
 backtest/
+ENV/
+.vscode/
+.idea/
+*.png
+*.jpg
